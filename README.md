@@ -51,7 +51,7 @@ Keep in mind that we are not expecting you to create a production-ready software
 
 - How to stream Txs via Solana API / SDK.
 - Whether it is pull- or push-based.
-- How computationally complex the processing of a Tx is.
+- How computationally complex the processing (decoding) of a Tx is.
 
 ### High-Level Architecture
 
@@ -60,3 +60,27 @@ Keep in mind that we are not expecting you to create a production-ready software
 - To scale up the REST server we can simply employ a reverse-proxy solution using nginx that round-robins to a number of running REST servers.
 - If we observe high load on the REST servers /transactions/:id endpoint we can employ Redis to cache results with a TTL, as Txs are immutable read-only data.
 - As persitence solution it makes sense to use a document storage where the transactions and their metadata are stored as json document with one (id) or more keys (datetime). Document based storage (NoSQL) allows for easy horizontal scaling at the cost of eventual consistency, which should be perfectly fine in this use case.
+
+## Plan
+
+1. Examine Solana API / SDK to understand how to stream Txs.
+2. Implement Tx aggregator prototype that just streams Txs but doesnt persist them yet.
+3. Add persisting of Txs to document storage.
+4. Implement REST server, fetching from document storage.
+5. If time permits, demonstrate scaling abilities of REST server using nginx.
+
+#### Document Storage
+
+After some brief research the decision was made to use MongoDB as document storage
+
+## Streaming Txs from Solana
+
+There exists the [solana-client crate](https://docs.rs/solana-client/latest/solana_client/) which has a pubsub client module which allows for subscribing to messages from the RPC server. The subscriber provides the `block_subscribe` method to receive a message if a block is confirmed or finalised. These messages contain info about the block, which also contains the vec of _encoded_ transactions.
+
+Unfortunately when testing this against the helius wss it returned "Method not found" which indicates that listening to block updates is disabled on the helius RPC nodes.
+
+https://www.helius.dev/blog/solana-data-streaming
+Alternative is to use webhooks provided by helius: https://docs.helius.dev/webhooks-and-websockets/enhanced-websockets
+
+It seems that can be used very easily via helius-rust-sdk https://github.com/helius-labs/helius-rust-sdk
+as an example https://github.com/helius-labs/helius-rust-sdk/blob/dev/examples/enhanced_websocket_transactions.rs

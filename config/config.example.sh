@@ -1,0 +1,1 @@
+export RPC_URL="wss://devnet.helius-rpc.com/?api-key="
