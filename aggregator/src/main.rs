@@ -1,17 +1,16 @@
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use log::info;
+use mongodb::{bson::Document, Client, Collection};
+use serde::{Deserialize, Serialize};
 use solana_client::{rpc_client::RpcClient, rpc_config::RpcBlockConfig};
+use solana_transaction_status::{EncodedTransaction, UiTransactionStatusMeta};
 use tokio::time::sleep;
 
 #[tokio::main]
 async fn main() {
     env_logger::init();
-
-    // TODO: create application config
-    let rpc_url = get_from_env_or_panic("RPC_URL");
-
-    let client = RpcClient::new(&rpc_url);
 
     // TODO: create application config
     // let url = get_from_env_or_panic("RPC_URL");
@@ -88,26 +87,41 @@ async fn main() {
     //     }
     // }
 
+    // Replace the placeholder with your Atlas connection string
+    let mongo_url = get_from_env_or_panic("MONGO_URL");
+    // Create a new client and connect to the server
+    // FIXME: handle unwrap
+    let client = Client::with_uri_str(mongo_url).await.unwrap();
+    // Get a handle on the movies collection
+    let database = client.database("solforge");
+    let transactions: Collection<Document> = database.collection("transactions");
+
+    // TODO: create application config
+    let rpc_url = get_from_env_or_panic("RPC_URL");
+
+    let client = RpcClient::new(&rpc_url);
+
     let mut start_slot = client.get_slot().unwrap();
 
-    loop {
-        // TODO: make configurable
-        sleep(Duration::from_millis(1000)).await;
+    // loop {
+    // TODO: make configurable
+    sleep(Duration::from_millis(1000)).await;
 
-        // FIXME: unwrap
-        // let end_slot = client.get_slot().unwrap();
-        // FIXME: unwrap
-        let blocks = client.get_blocks(start_slot, None).unwrap();
+    // FIXME: unwrap
+    // let end_slot = client.get_slot().unwrap();
+    // FIXME: unwrap
+    let blocks = client.get_blocks(start_slot, None).unwrap();
 
-        // NOTE: we are not including the last block in fetching as the last slot is the next
-        // start_slot. If we include it as well it would be fetched twice
-        fetch_blocks_for_slots(&client, &blocks[..blocks.len() - 1]);
+    // NOTE: we are not including the last block in fetching as the last slot is the next
+    // start_slot. If we include it as well it would be fetched twice
+    fetch_blocks_for_slots(&client, &transactions, &blocks[..blocks.len() - 1]).await;
 
-        start_slot = *blocks.last().unwrap_or(&start_slot);
-    }
+    start_slot = *blocks.last().unwrap_or(&start_slot);
+
+    //}
 }
 
-fn fetch_blocks_for_slots(client: &RpcClient, slots: &[u64]) {
+async fn fetch_blocks_for_slots(client: &RpcClient, coll: &Collection<Document>, slots: &[u64]) {
     info!("fetching blocks for slots {:?}", slots);
 
     // NOTE: to handle "Transaction version (0) is not supported by the requesting client. Please try the request again with the following configuration parameter: \"maxSupportedTransactionVersion\": 0""
@@ -121,14 +135,44 @@ fn fetch_blocks_for_slots(client: &RpcClient, slots: &[u64]) {
         // https://solana.com/docs/rpc/http/getblock
         // FIXME: handle unwrap
         let block = client.get_block_with_config(*s, block_cfg).unwrap();
+
+        // TODO: maybe simply take DateTime::now instead of querying due to delay
         // FIXME: handle unwrap
-        let block_json = serde_json::to_string(&block).unwrap();
+        let ts: i64 = client.get_block_time(*s).unwrap();
+        // FIXME: handle unwrap
+        let timestamp = DateTime::from_timestamp(ts, 0).unwrap();
 
         info!(
-            "Received block with hash for slot {:?}: {:?} resulting JSON: {:?}",
-            s, block.blockhash, block_json
+            "Received block with hash for slot {:?}: {:?} produced at time {:?}",
+            s, block.blockhash, timestamp
         );
+
+        if let Some(txs) = block.transactions {
+            for tx_encoded in txs {
+                let tx = SolanaTransaction {
+                    timestamp,
+                    block_hash: block.blockhash.clone(),
+                    block_slot: *s,
+                    transaction: tx_encoded.transaction,
+                    meta: tx_encoded.meta,
+                };
+
+                // FIXME: handle unwrap
+                let tx_doc = mongodb::bson::to_document(&tx).unwrap();
+                // FIXME: handle unwrap
+                coll.insert_one(tx_doc).await.unwrap();
+            }
+        }
     }
+}
+
+#[derive(Serialize, Deserialize)]
+struct SolanaTransaction {
+    timestamp: DateTime<Utc>,
+    block_hash: String,
+    block_slot: u64,
+    transaction: EncodedTransaction,
+    meta: Option<UiTransactionStatusMeta>,
 }
 
 fn get_from_env_or_panic(key: &str) -> String {
