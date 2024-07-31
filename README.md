@@ -72,9 +72,10 @@ An alternative would be to simply rely on Postgres, however for this use case it
 2. DONE Implement Tx aggregator prototype that just streams Txs but doesnt persist them yet.
 3. DONE Add persisting of Txs to document storage.
 4. DONE Implement prototype of REST server, fetching from document storage.
-5. TODO Implement proper REST endpoints (id and transactions).
-6. TODO Scale up/parallelise aggregator service so it can catch up with network.
-7. TODO Clean up code base, fixing unwraps and error handling.
+5. DONE Implement fetching transaction by id.
+6. DONE Implement fetching transaction by day timestamp.
+7. TODO Scale up/parallelise aggregator service so it can catch up with network.
+8. TODO Clean up code base, fixing unwraps and error handling.
 
 ## Solving Streaming Txs from Solana
 
@@ -98,3 +99,9 @@ As it seems the polling solution does work.
 Note that a polling solution is not ideal especially in a setting where we have such high frequency of new blocks as in Solana, where we can risk of falling behind if we dont poll fast enough. However given that the pushing (pubsub) mechanisms all didn't work (and we were running out of time to research other solutions) we decided to stick with this solution for now. From running some short tests it seems that the blocks that are returned by the `get_blocks` call is on average always the same, so this means we can keep up with the block production time of Solana. If however the list of new finalised blocks keeps growing each time, then we know we are processing new blocks slower than the network produces them, and therefore we need to find ways of scaling this up, probably by fetching blocks in parallel using an mcsp channel and e.g. 2-4 threads.
 
 Obviously also there is a balance to strike between how realtime the transactions/blocks should be and how many requests we make. Currently we fetch new blocks every 1_000 millseconds, which seems to be a good balance, however this can be change easily if tighter realtime polling is required and more generous Helius plans are available.
+
+## Time tracking
+
+~ 3 hours for Solana Tx fetching
+~ 2 hours for adding MongoDB
+~ 2 hours for REST server
