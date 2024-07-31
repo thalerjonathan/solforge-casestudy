@@ -1,15 +1,16 @@
+use std::borrow::BorrowMut;
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::DateTime;
 use log::info;
 use mongodb::{bson::Document, Client, Collection};
 use solana_client::{rpc_client::RpcClient, rpc_config::RpcBlockConfig};
+use tokio::sync::Mutex;
 use tokio::time::sleep;
 
 #[tokio::main]
 async fn main() {
-    env_logger::init();
-
     // TODO: create application config
     // let url = get_from_env_or_panic("RPC_URL");
     // NOTE: unfortunately it seems that helius nodes do not expose the block subscription method, so this wont work (will fail with "Method not found")
@@ -85,39 +86,88 @@ async fn main() {
     //     }
     // }
 
+    env_logger::init();
+
     let mongo_url = shared::get_from_env_or_panic("MONGO_URL");
     // FIXME: handle unwrap
     let client = Client::with_uri_str(mongo_url).await.unwrap();
     let database = client.database("solforge");
     let transactions: Collection<Document> = database.collection("transactions");
 
-    // TODO: create application config
     let rpc_url = shared::get_from_env_or_panic("RPC_URL");
+    let rpc_client = RpcClient::new(&rpc_url);
 
-    let client = RpcClient::new(&rpc_url);
+    let blocks_queue_arc: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
 
-    let mut start_slot = client.get_slot().unwrap();
-
-    // loop {
     // TODO: make configurable
-    sleep(Duration::from_millis(1000)).await;
+    for i in 0..5 {
+        tokio::spawn({
+            let blocks_queue_thread = blocks_queue_arc.clone();
+            let transactions_thread = transactions.clone();
+            let rpc_client_thread = RpcClient::new(&rpc_url);
 
-    // FIXME: unwrap
-    // let end_slot = client.get_slot().unwrap();
-    // FIXME: unwrap
-    let blocks = client.get_blocks(start_slot, None).unwrap();
+            async move {
+                loop {
+                    let block_slot_opt = {
+                        let mut guard: tokio::sync::MutexGuard<Vec<u64>> =
+                            blocks_queue_thread.lock().await;
+                        let blocks: &mut Vec<u64> = (*guard).borrow_mut();
+                        if !blocks.is_empty() {
+                            let block_slot: u64 = blocks.remove(0);
+                            Some(block_slot)
+                        } else {
+                            None
+                        }
+                    };
 
-    // NOTE: we are not including the last block in fetching as the last slot is the next
-    // start_slot. If we include it as well it would be fetched twice
-    fetch_blocks_for_slots(&client, &transactions, &blocks[..blocks.len() - 1]).await;
+                    if let Some(block_slot) = block_slot_opt {
+                        process_block(&rpc_client_thread, &transactions_thread, block_slot, i)
+                            .await;
+                    }
+                }
+            }
+        });
+    }
 
-    start_slot = *blocks.last().unwrap_or(&start_slot);
+    let mut start_slot = rpc_client.get_slot().unwrap();
 
-    //}
+    loop {
+        // TODO: make configurable
+        sleep(Duration::from_millis(1000)).await;
+
+        // FIXME: unwrap
+        // let end_slot = client.get_slot().unwrap();
+        // FIXME: unwrap
+        let blocks = rpc_client.get_blocks(start_slot, None).unwrap();
+
+        // NOTE: we are not including the last block in fetching as the last slot is the next
+        // start_slot. If we include it as well it would be fetched twice
+        let slots = &blocks[..blocks.len() - 1];
+        info!("Fetching blocks for slots {:?}", slots);
+
+        {
+            let mut blocks_queue_guard: tokio::sync::MutexGuard<Vec<u64>> =
+                blocks_queue_arc.lock().await;
+            let blocks_queue: &mut Vec<u64> = (*blocks_queue_guard).borrow_mut();
+
+            for s in slots {
+                blocks_queue.push(*s);
+            }
+        }
+        start_slot = *blocks.last().unwrap_or(&start_slot);
+    }
 }
 
-async fn fetch_blocks_for_slots(client: &RpcClient, coll: &Collection<Document>, slots: &[u64]) {
-    info!("fetching blocks for slots {:?}", slots);
+async fn process_block(
+    client: &RpcClient,
+    coll: &Collection<Document>,
+    block_slot: u64,
+    thread_idx: u64,
+) {
+    info!(
+        "Processing of block {} in thread {}...",
+        block_slot, thread_idx
+    );
 
     // NOTE: to handle "Transaction version (0) is not supported by the requesting client. Please try the request again with the following configuration parameter: \"maxSupportedTransactionVersion\": 0""
     // we need to use get_block_with_config with the corresponding config, see https://www.quicknode.com/guides/solana-development/transactions/how-to-update-your-solana-client-to-handle-versioned-transactions
@@ -126,38 +176,40 @@ async fn fetch_blocks_for_slots(client: &RpcClient, coll: &Collection<Document>,
         ..RpcBlockConfig::default()
     };
 
-    // TODO: employ mcsp channels to process slots across threads - share mongodb collection, as this is threadsafe
-    for s in slots {
-        // https://solana.com/docs/rpc/http/getblock
-        // FIXME: handle unwrap
-        let block = client.get_block_with_config(*s, block_cfg).unwrap();
+    // https://solana.com/docs/rpc/http/getblock
+    // FIXME: handle unwrap
+    let block = client.get_block_with_config(block_slot, block_cfg).unwrap();
 
-        // TODO: maybe simply take DateTime::now instead of querying due to delay
-        // FIXME: handle unwrap
-        let ts: i64 = client.get_block_time(*s).unwrap();
-        // FIXME: handle unwrap
-        let timestamp = DateTime::from_timestamp(ts, 0).unwrap();
+    // TODO: maybe simply take DateTime::now instead of querying due to delay
+    // FIXME: handle unwrap
+    let ts: i64 = client.get_block_time(block_slot).unwrap();
+    // FIXME: handle unwrap
+    let timestamp = DateTime::from_timestamp(ts, 0).unwrap();
 
-        info!(
-            "Received block with hash for slot {:?}: {:?} produced at time {:?}",
-            s, block.blockhash, timestamp
-        );
+    info!(
+        "Thread {} received block with hash {} for slot {} produced at time {}",
+        thread_idx, block.blockhash, block_slot, timestamp
+    );
 
-        if let Some(txs) = block.transactions {
-            for tx_encoded in txs {
-                let tx = shared::SolanaTransaction {
-                    timestamp,
-                    block_hash: block.blockhash.clone(),
-                    block_slot: *s,
-                    transaction: tx_encoded.transaction,
-                    meta: tx_encoded.meta,
-                };
+    if let Some(txs) = block.transactions {
+        for tx_encoded in txs {
+            let tx = shared::SolanaTransaction {
+                timestamp,
+                block_hash: block.blockhash.clone(),
+                block_slot,
+                transaction: tx_encoded.transaction,
+                meta: tx_encoded.meta,
+            };
 
-                // FIXME: handle unwrap
-                let tx_doc = mongodb::bson::to_document(&tx).unwrap();
-                // FIXME: handle unwrap
-                coll.insert_one(tx_doc).await.unwrap();
-            }
+            // FIXME: handle unwrap
+            let tx_doc = mongodb::bson::to_document(&tx).unwrap();
+            // FIXME: handle unwrap
+            coll.insert_one(tx_doc).await.unwrap();
         }
     }
+
+    info!(
+        "Processing of block {} finished in thread {}",
+        block_slot, thread_idx
+    );
 }

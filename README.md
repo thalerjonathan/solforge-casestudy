@@ -74,7 +74,7 @@ An alternative would be to simply rely on Postgres, however for this use case it
 4. DONE Implement prototype of REST server, fetching from document storage.
 5. DONE Implement fetching transaction by id.
 6. DONE Implement fetching transaction by day timestamp.
-7. TODO Scale up/parallelise aggregator service so it can catch up with network.
+7. DONE Scale up/parallelise aggregator service so it can catch up with network.
 8. TODO Clean up code base, fixing unwraps and error handling.
 
 ## Solving Streaming Txs from Solana
@@ -105,3 +105,4 @@ Obviously also there is a balance to strike between how realtime the transaction
 ~ 3 hours for Solana Tx fetching
 ~ 2 hours for adding MongoDB
 ~ 2 hours for REST server
+~ 1 hour for parallelising the Tx processing
