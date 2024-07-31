@@ -1,3 +1,3 @@
-. config/config.sh
+. config/config.aggregator.sh
 
 cargo run --release aggregator

@@ -71,10 +71,10 @@ An alternative would be to simply rely on Postgres, however for this use case it
 1. DONE Examine Solana API / SDK to understand how to stream Txs.
 2. DONE Implement Tx aggregator prototype that just streams Txs but doesnt persist them yet.
 3. DONE Add persisting of Txs to document storage.
-4. TODO Implement REST server, fetching from document storage.
-5. TODO Scale up/parallelise aggregator service so it can catch up with network.
-6. TODO Clean up code base, fixing unwraps and error handling.
-7. TODO If time permits, demonstrate scaling abilities of REST server using nginx.
+4. DONE Implement prototype of REST server, fetching from document storage.
+5. TODO Implement proper REST endpoints (id and transactions).
+6. TODO Scale up/parallelise aggregator service so it can catch up with network.
+7. TODO Clean up code base, fixing unwraps and error handling.
 
 ## Solving Streaming Txs from Solana
 

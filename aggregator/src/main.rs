@@ -1,11 +1,9 @@
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::DateTime;
 use log::info;
 use mongodb::{bson::Document, Client, Collection};
-use serde::{Deserialize, Serialize};
 use solana_client::{rpc_client::RpcClient, rpc_config::RpcBlockConfig};
-use solana_transaction_status::{EncodedTransaction, UiTransactionStatusMeta};
 use tokio::time::sleep;
 
 #[tokio::main]
@@ -87,17 +85,14 @@ async fn main() {
     //     }
     // }
 
-    // Replace the placeholder with your Atlas connection string
-    let mongo_url = get_from_env_or_panic("MONGO_URL");
-    // Create a new client and connect to the server
+    let mongo_url = shared::get_from_env_or_panic("MONGO_URL");
     // FIXME: handle unwrap
     let client = Client::with_uri_str(mongo_url).await.unwrap();
-    // Get a handle on the movies collection
     let database = client.database("solforge");
     let transactions: Collection<Document> = database.collection("transactions");
 
     // TODO: create application config
-    let rpc_url = get_from_env_or_panic("RPC_URL");
+    let rpc_url = shared::get_from_env_or_panic("RPC_URL");
 
     let client = RpcClient::new(&rpc_url);
 
@@ -131,6 +126,7 @@ async fn fetch_blocks_for_slots(client: &RpcClient, coll: &Collection<Document>,
         ..RpcBlockConfig::default()
     };
 
+    // TODO: employ mcsp channels to process slots across threads - share mongodb collection, as this is threadsafe
     for s in slots {
         // https://solana.com/docs/rpc/http/getblock
         // FIXME: handle unwrap
@@ -149,7 +145,7 @@ async fn fetch_blocks_for_slots(client: &RpcClient, coll: &Collection<Document>,
 
         if let Some(txs) = block.transactions {
             for tx_encoded in txs {
-                let tx = SolanaTransaction {
+                let tx = shared::SolanaTransaction {
                     timestamp,
                     block_hash: block.blockhash.clone(),
                     block_slot: *s,
@@ -164,17 +160,4 @@ async fn fetch_blocks_for_slots(client: &RpcClient, coll: &Collection<Document>,
             }
         }
     }
-}
-
-#[derive(Serialize, Deserialize)]
-struct SolanaTransaction {
-    timestamp: DateTime<Utc>,
-    block_hash: String,
-    block_slot: u64,
-    transaction: EncodedTransaction,
-    meta: Option<UiTransactionStatusMeta>,
-}
-
-fn get_from_env_or_panic(key: &str) -> String {
-    std::env::var(key).unwrap_or_else(|err| panic!("Cannot find {} in env: {}", key, err))
 }

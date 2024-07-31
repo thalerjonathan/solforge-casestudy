@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+shared = { path = "../shared" }
 solana-client = "2.0.3"
 solana-transaction-status = "2.0.3"
 tokio = { version = "1.39.2", features = ["full"] }
