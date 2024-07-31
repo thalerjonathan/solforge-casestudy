@@ -61,26 +61,39 @@ Keep in mind that we are not expecting you to create a production-ready software
 - If we observe high load on the REST servers /transactions/:id endpoint we can employ Redis to cache results with a TTL, as Txs are immutable read-only data.
 - As persitence solution it makes sense to use a document storage where the transactions and their metadata are stored as json document with one (id) or more keys (datetime). Document based storage (NoSQL) allows for easy horizontal scaling at the cost of eventual consistency, which should be perfectly fine in this use case.
 
+### Document Storage
+
+After some brief research the decision was made to use MongoDB as document storage. MongoDB is very popular and has a reach feature set, e.g. compared to CouchDB which is older.
+An alternative would be to simply rely on Postgres, however for this use case it seems like a document storage is better suited as its much easier to interact with, has more powerful querying ability and scales better horizontally.
+
 ## Plan
 
-1. Examine Solana API / SDK to understand how to stream Txs.
-2. Implement Tx aggregator prototype that just streams Txs but doesnt persist them yet.
-3. Add persisting of Txs to document storage.
-4. Implement REST server, fetching from document storage.
-5. If time permits, demonstrate scaling abilities of REST server using nginx.
+1. DONE Examine Solana API / SDK to understand how to stream Txs.
+2. DONE Implement Tx aggregator prototype that just streams Txs but doesnt persist them yet.
+3. TODO Add persisting of Txs to document storage.
+4. TODO Implement REST server, fetching from document storage.
+5. TODO Clean up code base, fixing unwraps and error handling.
+6. TODO If time permits, demonstrate scaling abilities of REST server using nginx.
 
-#### Document Storage
-
-After some brief research the decision was made to use MongoDB as document storage
-
-## Streaming Txs from Solana
+## Solving Streaming Txs from Solana
 
 There exists the [solana-client crate](https://docs.rs/solana-client/latest/solana_client/) which has a pubsub client module which allows for subscribing to messages from the RPC server. The subscriber provides the `block_subscribe` method to receive a message if a block is confirmed or finalised. These messages contain info about the block, which also contains the vec of _encoded_ transactions.
 
 Unfortunately when testing this against the helius wss it returned "Method not found" which indicates that listening to block updates is disabled on the helius RPC nodes.
 
-https://www.helius.dev/blog/solana-data-streaming
-Alternative is to use webhooks provided by helius: https://docs.helius.dev/webhooks-and-websockets/enhanced-websockets
+Trying to use the helius ws transaction subscription (see https://github.com/helius-labs/helius-rust-sdk
+as an example https://github.com/helius-labs/helius-rust-sdk/blob/dev/examples/enhanced_websocket_transactions.rs) seemed also not to be the right solution as it essentially filters for transactions, but we want all of them.
 
-It seems that can be used very easily via helius-rust-sdk https://github.com/helius-labs/helius-rust-sdk
-as an example https://github.com/helius-labs/helius-rust-sdk/blob/dev/examples/enhanced_websocket_transactions.rs
+The next attempt was to use the solana client slot subscription to get notifications of newly processed slots and use get_block to fetch the corresponding block. This initially caused problems but after switching to the nonblocking version notifications of new slots worked fine. However (obviously) this didn't work either, because finalising of slots by the network takes a while, so when fetching the block to a slot immediately when the slot was produced, results in "Block not available for slot ...".
+
+Next solution is to try a polling solution by fetching blocks for finalised slots.
+
+1. start with latest finalised slot using get_slot
+2. after a timeout of e.g. 1 seconds get the latest finalised blocks with get_blocks
+3. fetch each block for the returned blocks (slots)
+
+As it seems the polling solution does work.
+
+Note that a polling solution is not ideal especially in a setting where we have such high frequency of new blocks as in Solana, where we can risk of falling behind if we dont poll fast enough. However given that the pushing (pubsub) mechanisms all didn't work (and we were running out of time to research other solutions) we decided to stick with this solution for now. From running some short tests it seems that the blocks that are returned by the `get_blocks` call is on average always the same, so this means we can keep up with the block production time of Solana. If however the list of new finalised blocks keeps growing each time, then we know we are processing new blocks slower than the network produces them, and therefore we need to find ways of scaling this up, probably by fetching blocks in parallel using an mcsp channel and e.g. 2-4 threads.
+
+Obviously also there is a balance to strike between how realtime the transactions/blocks should be and how many requests we make. Currently we fetch new blocks every 1_000 millseconds, which seems to be a good balance, however this can be change easily if tighter realtime polling is required and more generous Helius plans are available.
