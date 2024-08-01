@@ -1,13 +1,22 @@
 use std::borrow::BorrowMut;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::DateTime;
-use log::{error, info};
+use chrono::{DateTime, Utc};
+use log::{error, info, warn};
+use mongodb::bson::doc;
+use mongodb::options::UpdateModifications;
 use mongodb::{bson::Document, Client, Collection};
+use shared::SolanaAccount;
 use solana_client::{rpc_client::RpcClient, rpc_config::RpcBlockConfig};
+use solana_program::pubkey::Pubkey;
+use solana_transaction_status::{EncodedTransaction, EncodedTransactionWithStatusMeta, UiMessage};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
+
+struct TransactionsCollection(Collection<Document>);
+struct AccountsCollection(Collection<Document>);
 
 #[tokio::main]
 async fn main() {
@@ -98,6 +107,7 @@ async fn main() {
         .expect("Failed creating MongoDB client");
     let mongo_database = mongo_client.database("solforge");
     let transactions_collection: Collection<Document> = mongo_database.collection("transactions");
+    let accounts_collection: Collection<Document> = mongo_database.collection("accounts");
 
     let blocks_queue_arc: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
 
@@ -111,9 +121,12 @@ async fn main() {
     // process blocks as fast as the network is producing them.
     for i in 0..block_workers {
         tokio::spawn({
-            let blocks_queue_thread = blocks_queue_arc.clone();
-            let transactions_collection_thread = transactions_collection.clone();
             let rpc_client_thread = RpcClient::new(&rpc_url);
+
+            let blocks_queue_thread = blocks_queue_arc.clone();
+            let transactions_collection_thread =
+                TransactionsCollection(transactions_collection.clone());
+            let accounts_collection_thread = AccountsCollection(accounts_collection.clone());
 
             async move {
                 loop {
@@ -136,6 +149,7 @@ async fn main() {
                         let ret = process_block(
                             &rpc_client_thread,
                             &transactions_collection_thread,
+                            &accounts_collection_thread,
                             block_slot,
                             i,
                         )
@@ -194,8 +208,9 @@ async fn main() {
 /// multi consumer mechanism. The ordering of blocks in the collection is irrelevant therefore
 /// this works.
 async fn process_block(
-    client: &RpcClient,
-    transactions_collection: &Collection<Document>,
+    rpc_client: &RpcClient,
+    transactions_collection: &TransactionsCollection,
+    accounts_collection: &AccountsCollection,
     block_slot: u64,
     thread_idx: u16,
 ) -> Result<(), String> {
@@ -212,15 +227,14 @@ async fn process_block(
     };
 
     // https://solana.com/docs/rpc/http/getblock
-    let block = client
+    let block = rpc_client
         .get_block_with_config(block_slot, block_cfg)
         .map_err(|err| format!("Failed get_block_with_config with error {}", err))?;
 
-    // TODO: maybe simply take DateTime::now instead of querying due to delay
-    let ts: i64 = client
-        .get_block_time(block_slot)
-        .map_err(|err| format!("Failed get_block_time with error {}", err))?;
-    let timestamp = DateTime::from_timestamp(ts, 0).unwrap_or(chrono::offset::Utc::now());
+    let timestamp = block
+        .block_time
+        .and_then(|ts| DateTime::from_timestamp(ts, 0))
+        .unwrap_or(chrono::offset::Utc::now());
 
     info!(
         "Thread {} received block with hash {} for slot {} produced at time {}",
@@ -229,21 +243,19 @@ async fn process_block(
 
     // iterate over all transactions (there might be none) and encode them to a MongoDB doc and insert into the collection
     if let Some(txs) = block.transactions {
-        for tx_encoded in txs {
-            let tx = shared::SolanaTransaction {
-                timestamp,
-                block_hash: block.blockhash.clone(),
+        for tx in txs {
+            let account_key_strs = process_transaction(
+                &tx,
+                block.blockhash.clone(),
                 block_slot,
-                transaction: tx_encoded.transaction,
-                meta: tx_encoded.meta,
-            };
+                timestamp,
+                transactions_collection,
+            )
+            .await?;
 
-            let tx_doc = mongodb::bson::to_document(&tx)
-                .map_err(|err| format!("Failed serialise transaction to bscon: {}", err))?;
-            transactions_collection
-                .insert_one(tx_doc)
-                .await
-                .map_err(|err| format!("Failed inserting transaction document: {}", err))?;
+            for acc in account_key_strs {
+                process_account(rpc_client, timestamp, accounts_collection, &acc).await?;
+            }
         }
     }
 
@@ -253,4 +265,113 @@ async fn process_block(
     );
 
     Ok(())
+}
+
+async fn process_transaction(
+    tx_encoded: &EncodedTransactionWithStatusMeta,
+    block_hash: String,
+    block_slot: u64,
+    timestamp: DateTime<Utc>,
+    transactions_collection: &TransactionsCollection,
+) -> Result<Vec<String>, String> {
+    // NOTE: for each account involved in the Tx, we fetch it because PubSub to account only works when one wants to listen to a specific account
+    let account_keys_str = extract_accounts_from_tx(&tx_encoded.transaction);
+
+    let tx = shared::SolanaTransaction {
+        timestamp,
+        block_hash,
+        block_slot,
+        transaction: tx_encoded.transaction.clone(),
+        meta: tx_encoded.meta.clone(),
+    };
+
+    let tx_doc = mongodb::bson::to_document(&tx)
+        .map_err(|err| format!("Failed serialise transaction to bscon: {}", err))?;
+    transactions_collection
+        .0
+        .insert_one(tx_doc)
+        .await
+        .map_err(|err| format!("Failed inserting transaction document: {}", err))?;
+
+    Ok(account_keys_str)
+}
+
+async fn process_account(
+    rpc_client: &RpcClient,
+    block_timestamp: DateTime<Utc>,
+    accounts_collection: &AccountsCollection,
+    account_pubkey_str: &str,
+) -> Result<(), String> {
+    // NOTE: in case we can't parse the pub key we emit a warning and ignore updating this account
+    match Pubkey::from_str(account_pubkey_str) {
+        Err(err) => {
+            warn!(
+                "Failed to parse Pubkey for account key {} with error: {}",
+                account_pubkey_str, err
+            );
+            Ok(())
+        }
+        Ok(pubkey) => {
+            // NOTE: in case we can't fetch the account we emit a warning and ignore updating this account
+            match rpc_client.get_account(&pubkey) {
+                Err(err) => {
+                    warn!("Failed get_account for key {} with error: {}", pubkey, err);
+                    Ok(())
+                }
+                Ok(account) => {
+                    info!("Loaded account for key {}: {:?}", pubkey, account);
+
+                    let account = SolanaAccount {
+                        _id: account_pubkey_str.to_string(),
+                        lastchanged: block_timestamp,
+                        lamports: account.lamports,
+                        data: account.data,
+                        owner: account.owner,
+                        executable: account.executable,
+                    };
+
+                    // NOTE: we update (override) the account only if this account is newer than the one
+                    // already stored, which is needed because we are processing blocks concurrently
+                    let block_timestamp_str =
+                        format!("{}", block_timestamp.format("%Y-%m-%dT%H:%M:%SZ"));
+                    let query = doc! { "lastchanged" : {"$gt": block_timestamp_str}};
+
+                    let account_doc = mongodb::bson::to_document(&account)
+                        .map_err(|err| format!("Failed serialise account to bscon: {}", err))?;
+                    let update = doc! { "$set": account_doc.clone() };
+
+                    // TODO: get update working
+
+                    accounts_collection
+                        .0
+                        .insert_one(account_doc)
+                        //.replace_one(query, account_doc)
+                        // .update_one(query, UpdateModifications::Document(update))
+                        .await
+                        .map_err(|err| format!("Failed inserting account document: {}", err))?;
+
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+fn extract_accounts_from_tx(tx: &EncodedTransaction) -> Vec<String> {
+    match tx {
+        EncodedTransaction::Json(ui_tx) => match ui_tx.message {
+            UiMessage::Parsed(ref ui_parsed_msg) => ui_parsed_msg
+                .account_keys
+                .iter()
+                .map(|a| a.pubkey.clone())
+                .collect(),
+            UiMessage::Raw(ref ui_raw_msg) => ui_raw_msg.account_keys.clone(),
+        },
+        EncodedTransaction::Accounts(ui_accounts_list) => ui_accounts_list
+            .account_keys
+            .iter()
+            .map(|a| a.pubkey.clone())
+            .collect(),
+        _ => Vec::new(),
+    }
 }

@@ -2,6 +2,7 @@ use std::{fmt::Display, str::FromStr};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use solana_sdk::pubkey::Pubkey;
 use solana_transaction_status::{EncodedTransaction, UiTransactionStatusMeta};
 
 /// Represents a transaction on Solana. Due to the fact that the transaction type fetched via get_block
@@ -18,6 +19,29 @@ pub struct SolanaTransaction {
     pub transaction: EncodedTransaction,
     /// The metadata of the transaction
     pub meta: Option<UiTransactionStatusMeta>,
+}
+
+/// Represents an account on Solana. Due to the fact that the account type fetched via get_block
+/// from solana-client does not hold the timestamp, nor block info, it is added here
+/// Also we are flattening the Account from solana-sdk type into this because serialising to
+/// BSON seems to cause an overflow when serialising rent_epoch: 18446744073709551615, therefore
+/// we simply ignore the rent_epoch for now as dealing with this is beyond the scope of this
+/// case study
+#[derive(Serialize, Deserialize, Debug)]
+pub struct SolanaAccount {
+    /// The pubkey of the account, used as MongoDb _id
+    pub _id: String,
+    /// The timestamp of the block the account was last changed by a Tx in this block
+    pub lastchanged: DateTime<Utc>,
+    /// lamports in the account
+    pub lamports: u64,
+    /// data held in this account
+    #[serde(with = "serde_bytes")]
+    pub data: Vec<u8>,
+    /// the program that owns this account. If executable, the program that loads this account.
+    pub owner: Pubkey,
+    /// this account's data contains a loaded program (and is now read-only)
+    pub executable: bool,
 }
 
 /// Gets a value from the environment and if not found panics.
