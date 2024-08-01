@@ -76,8 +76,8 @@ An alternative would be to simply rely on Postgres, however for this use case it
 6. DONE Implement fetching transaction by day timestamp.
 7. DONE Scale up/parallelise aggregator service so it can catch up with network.
 8. DONE Clean up code base, fixing unwraps and error handling, adding doc comments.
-9. TODO add streaming of account info (probably possible via callbacks)
-10. TODO add fetching of account info from new REST endpoints
+9. DONE add streaming of account info (update not working properly yet)
+10. DONE add fetching of account info from new REST endpoints
 
 ## Solving Streaming Txs from Solana
 
