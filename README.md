@@ -132,6 +132,7 @@ Possible integration and E2E tests:
 5. Start the REST server by running `start_server.sh`. By default it runs on localhost port 3000.
 6. Fetch transactions by id: `curl http://localhost:3000/transactions?id=58MKzFPeW6syG6unZT8Rsfn4yeKf1vtiH6XGAoj93xg4B6DKpi2ZeJuYU7zu1rbnBCGgQhftDZczYAPSHwHsrt3Z`
 7. Fetch transactions by day: `curl http://localhost:3000/transactions?day=31/07/2024`
+8. Fetch accunt by id: `curl http://localhost:3000/account/CTTHnWEM7WRQVp9gTZL2SDT1vtGrgu9hYEgtJhjwhDHx`
 
 ## Time tracking
 
