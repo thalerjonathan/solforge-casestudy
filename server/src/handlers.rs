@@ -5,19 +5,19 @@ use std::{
 };
 
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
 use chrono::NaiveDateTime;
+use futures::TryStreamExt;
 use log::error;
 use mongodb::{
     bson::{doc, Document},
     Collection,
 };
 
-use futures::stream::TryStreamExt;
 use serde::{de, Deserialize, Deserializer};
 
 /// Represents an application error, where the application failed to handle a response
@@ -53,9 +53,13 @@ impl AppError {
     }
 }
 
+pub struct TransactionsCollection(pub Collection<Document>);
+pub struct AccountsCollection(pub Collection<Document>);
+
 /// The server state holdilng the MongoDb collections from which to fetch
 pub struct ServerState {
-    pub transactions_collection: Collection<Document>,
+    pub transactions_collection: TransactionsCollection,
+    pub accounts_collection: AccountsCollection,
 }
 
 /// Representation of the 2 different query params that can be passed to the /transactions endpoint
@@ -120,7 +124,7 @@ pub async fn transactions(
         (None, None) => doc! {},
     };
 
-    let ret = state.transactions_collection.find(doc_query).await;
+    let ret = state.transactions_collection.0.find(doc_query).await;
     match ret {
         Ok(cursor) => {
             let docs: Vec<Document> = cursor.try_collect().await.map_err(|err| {
@@ -145,6 +149,46 @@ pub async fn transactions(
         Err(err) => {
             let err_msg = format!(
                 "Find query in transaction collection failed with error: {}",
+                err
+            );
+            error!("{}", err_msg);
+            Err(AppError::from_error(&err_msg))?
+        }
+    }
+}
+
+/// /account/:id endpoint handler
+pub async fn account(
+    State(state): State<Arc<ServerState>>,
+    Path(account_id): Path<String>,
+) -> Result<Json<Vec<shared::SolanaAccount>>, AppError> {
+    let doc_query = doc! { "_id": account_id };
+
+    let ret = state.accounts_collection.0.find(doc_query).await;
+    match ret {
+        Ok(cursor) => {
+            let docs: Vec<Document> = cursor.try_collect().await.map_err(|err| {
+                AppError::from_error(&format!(
+                    "Failed fetching all accounts documents with error: {}",
+                    err
+                ))
+            })?;
+
+            let txs_res: Result<Vec<shared::SolanaAccount>, _> =
+                docs.into_iter().map(mongodb::bson::from_document).collect();
+            let txs = txs_res.map_err(|err| {
+                AppError::from_error(&format!(
+                    "Failed deserialising account bson to json with error: {}",
+                    err
+                ))
+            })?;
+
+            Ok(Json(txs))
+        }
+
+        Err(err) => {
+            let err_msg = format!(
+                "Find query in accounts collection failed with error: {}",
                 err
             );
             error!("{}", err_msg);

@@ -140,4 +140,4 @@ Possible integration and E2E tests:
 ~ 2 hours for setting up REST server and implementing endpoints
 ~ 1 hour for parallelising the Tx processing
 ~ 1 hour of cleaning up (comments, unwrap, additional documentation)
-~ 1 hour of adding Accounts fetching
+~ 2 hours of adding Accounts fetching and REST endpoint

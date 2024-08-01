@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::{routing::get, Router};
-use handlers::{transactions, ServerState};
+use handlers::{account, transactions, AccountsCollection, ServerState, TransactionsCollection};
 use mongodb::Client;
 
 mod handlers;
@@ -18,16 +18,18 @@ async fn main() {
         .await
         .expect("Failed creating MongoDB client");
     let mongo_database = mongo_client.database("solforge");
-    let transactions_collection = mongo_database.collection("transactions");
+    let transactions_collection = TransactionsCollection(mongo_database.collection("transactions"));
+    let accounts_collection = AccountsCollection(mongo_database.collection("accounts"));
 
     let state = ServerState {
         transactions_collection,
+        accounts_collection,
     };
     let state_arc = Arc::new(state);
 
     let app = Router::new()
         .route("/transactions", get(transactions))
-        // TODO: add /accounts route
+        .route("/account/:id", get(account))
         .with_state(state_arc);
 
     let listener = tokio::net::TcpListener::bind(&server_host)
