@@ -1,7 +1,13 @@
-use std::{fmt, str::FromStr, sync::Arc};
+use std::{
+    fmt::{self, Display},
+    str::FromStr,
+    sync::Arc,
+};
 
 use axum::{
     extract::{Query, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
     Json,
 };
 use chrono::NaiveDateTime;
@@ -14,10 +20,45 @@ use mongodb::{
 use futures::stream::TryStreamExt;
 use serde::{de, Deserialize, Deserializer};
 
+/// Represents an application error, where the application failed to handle a response
+/// This is used to map such errors to 500 internal server error HTTP codes
+#[derive(Debug)]
+pub struct AppError {
+    error: String,
+}
+
+impl Display for AppError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+// NOTE: need to implement IntoResponse so that axum knows how to return 500 from an AppError
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        error!("Response error: {}", self);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed processing request due to error: {}", self),
+        )
+            .into_response()
+    }
+}
+
+impl AppError {
+    fn from_error(error: &str) -> Self {
+        Self {
+            error: error.to_string(),
+        }
+    }
+}
+
+/// The server state holdilng the MongoDb collections from which to fetch
 pub struct ServerState {
     pub transactions_collection: Collection<Document>,
 }
 
+/// Representation of the 2 different query params that can be passed to the /transactions endpoint
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 pub struct TxQuery {
@@ -41,48 +82,73 @@ where
     }
 }
 
+/// /transactions endpoint handler
 pub async fn transactions(
     State(state): State<Arc<ServerState>>,
     Query(tx_query): Query<TxQuery>,
-) -> Json<Vec<shared::SolanaTransaction>> {
+) -> Result<Json<Vec<shared::SolanaTransaction>>, AppError> {
+    // differentiate between supported query params, constructing different queries
     let doc_query = match (tx_query.id, tx_query.day) {
+        // query by Tx id, which in Solana are the signatures
         (Some(id), _) => doc! { "transaction.signatures": id },
+        // query by day in format day/month/year
         (None, Some(ref day)) => {
-            // FIXME: handle unwrap
             let from_date =
                 NaiveDateTime::parse_from_str(&format!("{} 00:00:00", day), "%d/%m/%Y %H:%M:%S")
-                    .unwrap();
-            // FIXME: handle unwrap
+                    .map_err(|err| {
+                        AppError::from_error(&format!(
+                            "Failed parsing day in from date with error: {}",
+                            err
+                        ))
+                    })?;
             let to_date =
                 NaiveDateTime::parse_from_str(&format!("{} 23:59:59", day), "%d/%m/%Y %H:%M:%S")
-                    .unwrap();
+                    .map_err(|err| {
+                        AppError::from_error(&format!(
+                            "Failed parsing day in to date with error: {}",
+                            err
+                        ))
+                    })?;
 
             let from_date_str = format!("{}", from_date.format("%Y-%m-%dT%H:%M:%SZ"));
             let to_date_str = format!("{}", to_date.format("%Y-%m-%dT%H:%M:%SZ"));
 
             doc! { "timestamp" : {"$gte": from_date_str, "$lt": to_date_str}}
         }
+        // return ALL Txs - might return a potentially very large set. Probably best to implement
+        // some form of paging, but this is beyond the scope of this exercise
         (None, None) => doc! {},
     };
 
     let ret = state.transactions_collection.find(doc_query).await;
     match ret {
         Ok(cursor) => {
-            // FIXME: handle unwrap
-            let docs: Vec<Document> = cursor.try_collect().await.unwrap();
+            let docs: Vec<Document> = cursor.try_collect().await.map_err(|err| {
+                AppError::from_error(&format!(
+                    "Failed fetching all transaction documents with error: {}",
+                    err
+                ))
+            })?;
 
-            let txs: Result<Vec<shared::SolanaTransaction>, _> =
+            let txs_res: Result<Vec<shared::SolanaTransaction>, _> =
                 docs.into_iter().map(mongodb::bson::from_document).collect();
+            let txs = txs_res.map_err(|err| {
+                AppError::from_error(&format!(
+                    "Failed deserialising transaction bson to json with error: {}",
+                    err
+                ))
+            })?;
 
-            // FIXME: handle unwrap
-            Json(txs.unwrap())
+            Ok(Json(txs))
         }
 
-        // FIXME: return clean error
         Err(err) => {
-            error!("Error {:?}", err);
-            // TODO: 500 server error
-            Json(Vec::new())
+            let err_msg = format!(
+                "Find query in transaction collection failed with error: {}",
+                err
+            );
+            error!("{}", err_msg);
+            Err(AppError::from_error(&err_msg))?
         }
     }
 }

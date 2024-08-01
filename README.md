@@ -75,7 +75,9 @@ An alternative would be to simply rely on Postgres, however for this use case it
 5. DONE Implement fetching transaction by id.
 6. DONE Implement fetching transaction by day timestamp.
 7. DONE Scale up/parallelise aggregator service so it can catch up with network.
-8. TODO Clean up code base, fixing unwraps and error handling.
+8. DONE Clean up code base, fixing unwraps and error handling, adding doc comments.
+9. TODO add streaming of account info (probably possible via callbacks)
+10. TODO add fetching of account info from new REST endpoints
 
 ## Solving Streaming Txs from Solana
 
@@ -100,9 +102,41 @@ Note that a polling solution is not ideal especially in a setting where we have 
 
 Obviously also there is a balance to strike between how realtime the transactions/blocks should be and how many requests we make. Currently we fetch new blocks every 1_000 millseconds, which seems to be a good balance, however this can be change easily if tighter realtime polling is required and more generous Helius plans are available.
 
+## Testing
+
+Generally tests are written following a "testing pyramid", that consists of 3 layers, bottom to top:
+
+1. A large number of unit tests, that execute fast, and cover complex domain logic.
+2. A number of integration tests, that take longer to execute and cover integration between modules as well as with infrastructure. Integration tests can be split into mocked tests where we are dealing with mocks, therefore we can call them something like unit tests; and full integration tests, where the code under test runs against some test infrastructure such as a local MongoDB instance.
+3. A few E2E tests that test the system via its external endpoints and check the observable effects.
+
+I didn't implement any tests in this case study for the following reasons:
+
+- There isnt any complex domain logic that needs test coverage, as the main complexity of this case study lies in the interaction with the infrastructure.
+- When dealing with complex integration we can employ mocks, full integration tests and E2E tests, all of which I deemed outside the scope of this case study.
+
+Possible integration and E2E tests:
+
+- Mock MongoDb with a trait and write unit (integration) tests for the REST handler
+- Testing the aggregator with integration tests doesnt make much sense, rather focus on E2E tests here
+  - Start a fresh (empty) local MongoDB.
+  - Configure aggregator to fetch a single given block which we know what is in it.
+  - Fetch txs we know are in the block from REST endpoint and compare with expected data.
+
+## Running
+
+1. Start MongoDB by running `start_mongo.sh`
+2. Make a copy of `config/config.aggregator.example.sh` to `config/config.aggregator.sh` and configure `RPC_URL` to a corresponding RPC Solana node endpoint.
+3. Start aggregator service by running `start_aggregator.sh`
+4. Make a copy of `config/config.server.example.sh` to `config/config.server.sh`. No need to configure anything, the defaults should be fine.
+5. Start the REST server by running `start_server.sh`. By default it runs on localhost port 3000.
+6. Fetch transactions by id: `curl http://localhost:3000/transactions?id=58MKzFPeW6syG6unZT8Rsfn4yeKf1vtiH6XGAoj93xg4B6DKpi2ZeJuYU7zu1rbnBCGgQhftDZczYAPSHwHsrt3Z`
+7. Fetch transactions by day: `curl http://localhost:3000/transactions?day=31/07/2024`
+
 ## Time tracking
 
 ~ 3 hours for Solana Tx fetching
 ~ 2 hours for adding MongoDB
-~ 2 hours for REST server
+~ 2 hours for setting up REST server and implementing endpoints
 ~ 1 hour for parallelising the Tx processing
+~ 1 hour of cleaning up (comments, unwrap, additional documentation)

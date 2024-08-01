@@ -1,4 +1,4 @@
-export MONGO_URL="mongodb://USER:PW@HOST:27017/"
+export MONGO_URL="mongodb://admin:admin@localhost:27017/"
 
 export HOST='localhost:3000'
 
