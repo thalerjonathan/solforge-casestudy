@@ -334,21 +334,19 @@ async fn process_account(
                     // already stored, which is needed because we are processing blocks concurrently
                     let block_timestamp_str =
                         format!("{}", block_timestamp.format("%Y-%m-%dT%H:%M:%SZ"));
-                    let query = doc! { "lastchanged" : {"$gt": block_timestamp_str}};
 
+                    let update_filter = doc! { "_id": account_pubkey_str
+                    , "lastchanged" : {"$gt": block_timestamp_str}};
                     let account_doc = mongodb::bson::to_document(&account)
                         .map_err(|err| format!("Failed serialise account to bscon: {}", err))?;
-                    let update = doc! { "$set": account_doc.clone() };
-
-                    // TODO: get update working
+                    let update = doc! { "$set": &account_doc };
 
                     accounts_collection
                         .0
-                        .insert_one(account_doc)
-                        //.replace_one(query, account_doc)
-                        // .update_one(query, UpdateModifications::Document(update))
+                        .update_one(update_filter, UpdateModifications::Document(update))
+                        .upsert(true)
                         .await
-                        .map_err(|err| format!("Failed inserting account document: {}", err))?;
+                        .map_err(|err| format!("Failed updating account document: {}", err))?;
 
                     Ok(())
                 }

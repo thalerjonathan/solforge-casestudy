@@ -102,6 +102,8 @@ Note that a polling solution is not ideal especially in a setting where we have 
 
 Obviously also there is a balance to strike between how realtime the transactions/blocks should be and how many requests we make. Currently we fetch new blocks every 1_000 millseconds, which seems to be a good balance, however this can be change easily if tighter realtime polling is required and more generous Helius plans are available.
 
+Update: due to each block processing taking quite some time due to RPC roundtrips to fetch the block as well as fetching account infos, this means that in a single-threaded execution model the aggregator could not keep up with the networks speed of producing blocks. Therefore the aggregator was refactored into a solution that processes the blocks in parallel by pushing block slot numbers to process into a shared queue that is processed concurrently by a configurable number of worker threads. However this resulted in out-of-sequence processing of blocks, which is a problem as soon as we added fetching of accounts: for accounts we always want the latest info in the collection, so ordering matters. This was solved by giving each account entry a "lastmodified" timestamp that holds the blocks timestamp, and restricting updating only to newer timestamps. Given that blocks have strong monotounsly increasing block times this means that we will get right ordering - as within blocks, the accounts are processed in order of Txs, so we rely on Solanas ordering there, which we assume is correct.
+
 ## Testing
 
 Generally tests are written following a "testing pyramid", that consists of 3 layers, bottom to top:
@@ -142,3 +144,4 @@ Possible integration and E2E tests:
 ~ 1 hour for parallelising the Tx processing
 ~ 1 hour of cleaning up (comments, unwrap, additional documentation)
 ~ 2 hours of adding Accounts fetching and REST endpoint
+~ 1 hour of fixing upserting Accounts (and refactoring account REST endpoint to fetch_one)

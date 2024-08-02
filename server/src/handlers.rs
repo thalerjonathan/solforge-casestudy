@@ -161,38 +161,35 @@ pub async fn transactions(
 pub async fn account(
     State(state): State<Arc<ServerState>>,
     Path(account_id): Path<String>,
-) -> Result<Json<Vec<shared::SolanaAccount>>, AppError> {
+) -> Result<Json<Option<shared::SolanaAccount>>, AppError> {
     let doc_query = doc! { "_id": account_id };
 
-    let ret = state.accounts_collection.0.find(doc_query).await;
-    match ret {
-        Ok(cursor) => {
-            let docs: Vec<Document> = cursor.try_collect().await.map_err(|err| {
-                AppError::from_error(&format!(
-                    "Failed fetching all accounts documents with error: {}",
-                    err
-                ))
-            })?;
+    let ret = state
+        .accounts_collection
+        .0
+        .find_one(doc_query)
+        .await
+        .map_err(|err| {
+            AppError::from_error(&format!(
+                "Find query in accounts collection failed with error: {}",
+                err
+            ))
+        })?;
 
-            let txs_res: Result<Vec<shared::SolanaAccount>, _> =
-                docs.into_iter().map(mongodb::bson::from_document).collect();
-            let txs = txs_res.map_err(|err| {
+    match ret {
+        Some(account_doc) => {
+            let account_res: Result<shared::SolanaAccount, _> =
+                mongodb::bson::from_document(account_doc);
+            let account = account_res.map_err(|err| {
                 AppError::from_error(&format!(
                     "Failed deserialising account bson to json with error: {}",
                     err
                 ))
             })?;
 
-            Ok(Json(txs))
+            Ok(Json(Some(account)))
         }
 
-        Err(err) => {
-            let err_msg = format!(
-                "Find query in accounts collection failed with error: {}",
-                err
-            );
-            error!("{}", err_msg);
-            Err(AppError::from_error(&err_msg))?
-        }
+        None => Ok(Json(None)),
     }
 }
