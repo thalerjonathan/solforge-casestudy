@@ -1,10 +1,9 @@
-use std::borrow::BorrowMut;
+use std::collections::HashSet;
 use std::str::FromStr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use mongodb::bson::doc;
 use mongodb::options::UpdateModifications;
 use mongodb::{bson::Document, Client, Collection};
@@ -12,10 +11,12 @@ use shared::SolanaAccount;
 use solana_client::{rpc_client::RpcClient, rpc_config::RpcBlockConfig};
 use solana_program::pubkey::Pubkey;
 use solana_transaction_status::{EncodedTransaction, EncodedTransactionWithStatusMeta, UiMessage};
-use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
+#[derive(Clone)]
 struct TransactionsCollection(Collection<Document>);
+#[derive(Clone)]
 struct AccountsCollection(Collection<Document>);
 
 #[tokio::main]
@@ -95,8 +96,7 @@ async fn main() {
 
     let mongo_url = shared::get_from_env_or_panic("MONGO_URL");
     let rpc_url = shared::get_from_env_or_panic("RPC_URL");
-    let block_workers: u16 = shared::parse_from_env_or_panic("BLOCK_WORKERS_COUNT");
-    let block_poll_interval_millis: u64 =
+    let block_poll_interval_millis: u128 =
         shared::parse_from_env_or_panic("BLOCK_POLL_INTERVAL_MILLIS");
 
     let rpc_client = RpcClient::new(&rpc_url);
@@ -106,70 +106,17 @@ async fn main() {
         .await
         .expect("Failed creating MongoDB client");
     let mongo_database = mongo_client.database("solforge");
-    let transactions_collection: Collection<Document> = mongo_database.collection("transactions");
-    let accounts_collection: Collection<Document> = mongo_database.collection("accounts");
-
-    let blocks_queue_arc: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+    let transactions_collection = TransactionsCollection(mongo_database.collection("transactions"));
+    let accounts_collection = AccountsCollection(mongo_database.collection("accounts"));
 
     // NOTE: at this point we panic as there is nothing we can do to recover if we fail to fetch the latest finalised slot
     let mut start_slot = rpc_client
         .get_slot()
         .expect("Failed to fetch latest finalised slot");
 
-    // spawning block workers, that all synchronise on the blocks_queue_arc Mutex. This is a
-    // single producer (main thread), multi consumer (block workers) pattern, to be able to
-    // process blocks as fast as the network is producing them.
-    for i in 0..block_workers {
-        tokio::spawn({
-            let rpc_client_thread = RpcClient::new(&rpc_url);
-
-            let blocks_queue_thread = blocks_queue_arc.clone();
-            let transactions_collection_thread =
-                TransactionsCollection(transactions_collection.clone());
-            let accounts_collection_thread = AccountsCollection(accounts_collection.clone());
-
-            async move {
-                loop {
-                    // fetching the next block slot to process - doing within a separate
-                    // block to avoid holding the mutex for too long
-                    let block_slot_opt = {
-                        let mut guard: tokio::sync::MutexGuard<Vec<u64>> =
-                            blocks_queue_thread.lock().await;
-                        let blocks: &mut Vec<u64> = (*guard).borrow_mut();
-                        if !blocks.is_empty() {
-                            let block_slot: u64 = blocks.remove(0);
-                            Some(block_slot)
-                        } else {
-                            None
-                        }
-                    };
-
-                    // if there is some block to be processed in the queue, process it now
-                    if let Some(block_slot) = block_slot_opt {
-                        let ret = process_block(
-                            &rpc_client_thread,
-                            &transactions_collection_thread,
-                            &accounts_collection_thread,
-                            block_slot,
-                            i,
-                        )
-                        .await;
-                        // NOTE: at this point we simply log errors, without dealing with them individually
-                        // In a production environment you may want to differentiate between errors
-                        // and attempt retries e.g. when interacting with RPC, but this beyond
-                        // the scope of this exercise
-                        if let Err(err) = ret {
-                            error!("Failed processing block: {}", err);
-                        }
-                    }
-                }
-            }
-        });
-    }
-
-    // TODO: implement account info fetching (probably via callbacks?)
-
     loop {
+        let start_time = Instant::now();
+
         // NOTE: we simply panic here as there is nothing we can do to recover from this with reasonable effort
         // Yes, we can implement retries and other fallback mechanisms, but this is beyond the scope of this exercise
         let blocks = rpc_client
@@ -179,26 +126,81 @@ async fn main() {
         // NOTE: we are not including the last block in fetching as the last slot is the next
         // start_slot. If we include it as well it would be fetched twice
         let slots = &blocks[..blocks.len() - 1];
-        info!("Fetching blocks for slots {:?}", slots);
 
-        // NOTE: separate block to make guard get out of scope to unlock Mutex as quickly as possible
-        {
-            let mut blocks_queue_guard: tokio::sync::MutexGuard<Vec<u64>> =
-                blocks_queue_arc.lock().await;
-            let blocks_queue: &mut Vec<u64> = (*blocks_queue_guard).borrow_mut();
-
-            for s in slots {
-                blocks_queue.push(*s);
-            }
-        }
+        // processing blocks returns the set of all accounts that were involved in the Txs
+        let accounts: HashSet<Pubkey> =
+            process_blocks(&rpc_url, &transactions_collection, slots).await;
+        // processing set of all acounts, using tasks. Given that there are no duplicates due
+        // to hashset, we can process them all in parallel without any issue of inconsistent data
+        process_accounts(&rpc_url, &accounts_collection, accounts).await;
 
         // updating the start slot for the next pull iteration to be the last of the current batch
         // note that the last block is not fetched as it is used as starting point for the next
         // pull iteration after the timeout
         start_slot = *blocks.last().unwrap_or(&start_slot);
 
-        sleep(Duration::from_millis(block_poll_interval_millis)).await;
+        let delta = Instant::now() - start_time;
+        if delta.as_millis() > block_poll_interval_millis {
+            warn!("Processing blocks and accounts took {} millisecondes which is longer than the block polling interval of {} milliseconds.\
+                This indicates that the Solana Network is producing blocks faster than the aggregator can consume them.", 
+                    delta.as_millis() , block_poll_interval_millis);
+        } else {
+            let waiting_time_millis = block_poll_interval_millis - delta.as_millis();
+            sleep(Duration::from_millis(waiting_time_millis as u64)).await;
+        }
     }
+}
+
+async fn process_blocks(
+    rpc_url: &str,
+    transactions_collection: &TransactionsCollection,
+    slots: &[u64],
+) -> HashSet<Pubkey> {
+    info!("Fetching blocks for slots {:?}", slots);
+
+    let block_hdls: Vec<JoinHandle<Result<Vec<Pubkey>, String>>> = slots
+        .iter()
+        .map(|block_slot| {
+            tokio::spawn({
+                let rpc_client_thread = RpcClient::new(rpc_url);
+                let transactions_collection_thread = transactions_collection.clone();
+                let block_slot_thread = *block_slot;
+                async move {
+                    process_block(
+                        &rpc_client_thread,
+                        &transactions_collection_thread,
+                        block_slot_thread,
+                    )
+                    .await
+                }
+            })
+        })
+        .collect();
+
+    let mut accounts: HashSet<Pubkey> = HashSet::new();
+
+    // NOTE: we are collecting all accounts into a HashSet so we avoid duplicate work
+    // as well as inconsistencies due to concurrent updates
+    for hdl in block_hdls {
+        // NOTE: at this point we simply panic, in a production environment we problably
+        // need to deal with it more gracefully, such as retrying, or other cleanup
+        let ret = hdl
+            .await
+            .expect("Awaiting block processing thread handle failed");
+
+        match ret {
+            // NOTE: at this point we simply log errors, without dealing with them individually
+            // In a production environment you may want to differentiate between errors
+            // and attempt retries e.g. when interacting with RPC, but this beyond
+            // the scope of this exercise
+            Err(err) => error!("Failed processing block: {}", err),
+            Ok(pks) => pks.iter().for_each(|pk| {
+                accounts.insert(*pk);
+            }),
+        }
+    }
+
+    accounts
 }
 
 /// Processes a block given its slot number. It fetches the corresponding block as well as its
@@ -210,14 +212,9 @@ async fn main() {
 async fn process_block(
     rpc_client: &RpcClient,
     transactions_collection: &TransactionsCollection,
-    accounts_collection: &AccountsCollection,
     block_slot: u64,
-    thread_idx: u16,
-) -> Result<(), String> {
-    info!(
-        "Processing of block {} in thread {}...",
-        block_slot, thread_idx
-    );
+) -> Result<Vec<Pubkey>, String> {
+    info!("Processing of block {}...", block_slot);
 
     // NOTE: to handle "Transaction version (0) is not supported by the requesting client. Please try the request again with the following configuration parameter: \"maxSupportedTransactionVersion\": 0""
     // we need to use get_block_with_config with the corresponding config, see https://www.quicknode.com/guides/solana-development/transactions/how-to-update-your-solana-client-to-handle-versioned-transactions
@@ -237,14 +234,16 @@ async fn process_block(
         .unwrap_or(chrono::offset::Utc::now());
 
     info!(
-        "Thread {} received block with hash {} for slot {} produced at time {}",
-        thread_idx, block.blockhash, block_slot, timestamp
+        "Received block with hash {} for slot {} produced at time {}",
+        block.blockhash, block_slot, timestamp
     );
+
+    let mut account_pubkeys = Vec::new();
 
     // iterate over all transactions (there might be none) and encode them to a MongoDB doc and insert into the collection
     if let Some(txs) = block.transactions {
         for tx in txs {
-            let account_key_strs = process_transaction(
+            let account_pubkey_strs = process_transaction(
                 &tx,
                 block.blockhash.clone(),
                 block_slot,
@@ -253,18 +252,21 @@ async fn process_block(
             )
             .await?;
 
-            for acc in account_key_strs {
-                process_account(rpc_client, timestamp, accounts_collection, &acc).await?;
+            for account_pubkey_str in account_pubkey_strs {
+                match Pubkey::from_str(&account_pubkey_str) {
+                    Ok(pk) => account_pubkeys.push(pk),
+                    Err(err) => warn!(
+                        "Failed to parse Pubkey for account key {} with error: {}",
+                        account_pubkey_str, err
+                    ),
+                }
             }
         }
     }
 
-    info!(
-        "Processing of block {} finished in thread {}",
-        block_slot, thread_idx
-    );
+    info!("Processing of block {} finished", block_slot);
 
-    Ok(())
+    Ok(account_pubkeys)
 }
 
 async fn process_transaction(
@@ -296,61 +298,98 @@ async fn process_transaction(
     Ok(account_keys_str)
 }
 
+/// This processes all accounts in the HashSet, by fetching the account info for each in a
+/// separate task. Due to the fact that we are using a HashSet we have the guarantee that
+/// no account will be fetched twice (or more), therefore we can parallelise this perfectly
+/// without running into consistency issues due to out-of-sequence updates.
+/// NOTE: this runs into Helius rate limitations when there are too many accounts
+async fn process_accounts(
+    rpc_url: &str,
+    accounts_collection: &AccountsCollection,
+    accounts: HashSet<Pubkey>,
+) {
+    let accounts_count = accounts.len();
+    info!("Updating {} accounts ...", accounts_count);
+
+    let start = Instant::now();
+
+    let account_processing_hdls: Vec<JoinHandle<Result<(), String>>> = accounts
+        .into_iter()
+        .map(|account_pkh| {
+            tokio::spawn({
+                let rpc_client_thread = RpcClient::new(rpc_url);
+                let accounts_collection_thread = accounts_collection.clone();
+                async move {
+                    process_account(&rpc_client_thread, &accounts_collection_thread, account_pkh)
+                        .await
+                }
+            })
+        })
+        .collect();
+
+    for hdl in account_processing_hdls {
+        // NOTE: at this point we simply panic, in a production environment we problably
+        // need to deal with it more gracefully, such as retrying, or other cleanup
+        let ret = hdl
+            .await
+            .expect("Awaiting account processing thread handle failed");
+
+        if let Err(err) = ret {
+            // NOTE: at this point we simply log errors, without dealing with them individually
+            // In a production environment you may want to differentiate between errors
+            // and attempt retries e.g. when interacting with RPC, but this beyond
+            // the scope of this exercise
+            error!("Failed processing account: {}", err);
+        }
+    }
+
+    let now = Instant::now();
+
+    info!(
+        "Updating {} accounts finished and took {:?} seconds",
+        accounts_count,
+        (now - start)
+    );
+}
+
 async fn process_account(
     rpc_client: &RpcClient,
-    block_timestamp: DateTime<Utc>,
     accounts_collection: &AccountsCollection,
-    account_pubkey_str: &str,
+    account_pkh: Pubkey,
 ) -> Result<(), String> {
-    // NOTE: in case we can't parse the pub key we emit a warning and ignore updating this account
-    match Pubkey::from_str(account_pubkey_str) {
+    // NOTE: in case we can't fetch the account we emit a warning and ignore updating this account
+    match rpc_client.get_account(&account_pkh) {
         Err(err) => {
             warn!(
-                "Failed to parse Pubkey for account key {} with error: {}",
-                account_pubkey_str, err
+                "Failed get_account for key {} with error: {}",
+                account_pkh, err
             );
             Ok(())
         }
-        Ok(pubkey) => {
-            // NOTE: in case we can't fetch the account we emit a warning and ignore updating this account
-            match rpc_client.get_account(&pubkey) {
-                Err(err) => {
-                    warn!("Failed get_account for key {} with error: {}", pubkey, err);
-                    Ok(())
-                }
-                Ok(account) => {
-                    info!("Loaded account for key {}: {:?}", pubkey, account);
+        Ok(account) => {
+            debug!("Loaded account for key {}: {:?}", account_pkh, account);
 
-                    let account = SolanaAccount {
-                        _id: account_pubkey_str.to_string(),
-                        lastchanged: block_timestamp,
-                        lamports: account.lamports,
-                        data: account.data,
-                        owner: account.owner,
-                        executable: account.executable,
-                    };
+            let account = SolanaAccount {
+                _id: account_pkh.to_string(),
+                lamports: account.lamports,
+                data: account.data,
+                owner: account.owner,
+                executable: account.executable,
+            };
 
-                    // NOTE: we update (override) the account only if this account is newer than the one
-                    // already stored, which is needed because we are processing blocks concurrently
-                    let block_timestamp_str =
-                        format!("{}", block_timestamp.format("%Y-%m-%dT%H:%M:%SZ"));
+            let update_filter = doc! { "_id": account_pkh.to_string()};
+            let account_doc = mongodb::bson::to_document(&account)
+                .map_err(|err| format!("Failed serialise account to bscon: {}", err))?;
+            let update = doc! { "$set": &account_doc };
 
-                    let update_filter = doc! { "_id": account_pubkey_str
-                    , "lastchanged" : {"$gt": block_timestamp_str}};
-                    let account_doc = mongodb::bson::to_document(&account)
-                        .map_err(|err| format!("Failed serialise account to bscon: {}", err))?;
-                    let update = doc! { "$set": &account_doc };
+            accounts_collection
+                .0
+                .update_one(update_filter, UpdateModifications::Document(update))
+                .upsert(true)
+                .await
+                .map_err(|err| format!("Failed updating account document: {}", err))?;
 
-                    accounts_collection
-                        .0
-                        .update_one(update_filter, UpdateModifications::Document(update))
-                        .upsert(true)
-                        .await
-                        .map_err(|err| format!("Failed updating account document: {}", err))?;
-
-                    Ok(())
-                }
-            }
+            Ok(())
         }
     }
 }

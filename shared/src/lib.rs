@@ -31,8 +31,6 @@ pub struct SolanaTransaction {
 pub struct SolanaAccount {
     /// The pubkey of the account, used as MongoDb _id
     pub _id: String,
-    /// The timestamp of the block the account was last changed by a Tx in this block
-    pub lastchanged: DateTime<Utc>,
     /// lamports in the account
     pub lamports: u64,
     /// data held in this account
