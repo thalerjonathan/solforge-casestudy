@@ -99,7 +99,8 @@ async fn main() {
     let block_poll_interval_millis: u128 =
         shared::parse_from_env_or_panic("BLOCK_POLL_INTERVAL_MILLIS");
 
-    let rpc_client = RpcClient::new(&rpc_url);
+    let rpc_client_box = Box::new(RpcClient::new(&rpc_url));
+    let rpc_client: &'static RpcClient = Box::leak(rpc_client_box);
 
     // NOTE: at this point we panic there is nothing we can do to recover from failing to create a MongoDB client
     let mongo_client = Client::with_uri_str(mongo_url)
@@ -129,10 +130,10 @@ async fn main() {
 
         // processing blocks returns the set of all accounts that were involved in the Txs
         let accounts: HashSet<Pubkey> =
-            process_blocks(&rpc_url, &transactions_collection, slots).await;
+            process_blocks(rpc_client, &transactions_collection, slots).await;
         // processing set of all acounts, using tasks. Given that there are no duplicates due
         // to hashset, we can process them all in parallel without any issue of inconsistent data
-        process_accounts(&rpc_url, &accounts_collection, accounts).await;
+        process_accounts(rpc_client, &accounts_collection, accounts).await;
 
         // updating the start slot for the next pull iteration to be the last of the current batch
         // note that the last block is not fetched as it is used as starting point for the next
@@ -152,7 +153,7 @@ async fn main() {
 }
 
 async fn process_blocks(
-    rpc_url: &str,
+    rpc_client: &'static RpcClient,
     transactions_collection: &TransactionsCollection,
     slots: &[u64],
 ) -> HashSet<Pubkey> {
@@ -162,12 +163,12 @@ async fn process_blocks(
         .iter()
         .map(|block_slot| {
             tokio::spawn({
-                let rpc_client_thread = RpcClient::new(rpc_url);
+                // let rpc_client_thread = RpcClient::new(rpc_url);
                 let transactions_collection_thread = transactions_collection.clone();
                 let block_slot_thread = *block_slot;
                 async move {
                     process_block(
-                        &rpc_client_thread,
+                        rpc_client,
                         &transactions_collection_thread,
                         block_slot_thread,
                     )
@@ -302,9 +303,9 @@ async fn process_transaction(
 /// separate task. Due to the fact that we are using a HashSet we have the guarantee that
 /// no account will be fetched twice (or more), therefore we can parallelise this perfectly
 /// without running into consistency issues due to out-of-sequence updates.
-/// NOTE: this runs into Helius rate limitations when there are too many accounts
+/// NOTE: this runs into Helius rate limitations when there are too many accounts: HTTP status client error (429 Too Many Requests
 async fn process_accounts(
-    rpc_url: &str,
+    rpc_client: &'static RpcClient,
     accounts_collection: &AccountsCollection,
     accounts: HashSet<Pubkey>,
 ) {
@@ -317,11 +318,9 @@ async fn process_accounts(
         .into_iter()
         .map(|account_pkh| {
             tokio::spawn({
-                let rpc_client_thread = RpcClient::new(rpc_url);
                 let accounts_collection_thread = accounts_collection.clone();
                 async move {
-                    process_account(&rpc_client_thread, &accounts_collection_thread, account_pkh)
-                        .await
+                    process_account(rpc_client, &accounts_collection_thread, account_pkh).await
                 }
             })
         })
